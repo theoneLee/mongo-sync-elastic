@@ -4,17 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/elastic/go-elasticsearch/v7/esapi"
+	"github.com/elastic/go-elasticsearch/v7/esutil"
 	"io/ioutil"
+	"log"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/elastic/go-elasticsearch/v7"
 	"mongo-sync-elastic/log"
 	"mongo-sync-elastic/service"
 	"mongo-sync-elastic/utils"
 
-	"github.com/olivere/elastic"
+	//"github.com/olivere/elastic/v7"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -115,12 +120,15 @@ func main() {
 	case service.SyncTypeFull:
 	}
 
+	InitEs(config)
+
 	//连接es和mongodb
-	esCli, err := elastic.NewClient(elastic.SetURL(config.EsUrl))
-	if err != nil {
-		molog.ErrorLog.Printf("connect es  err:%v\n", err)
-		return
-	}
+	//elastic.SetSniff(false)
+	//esCli, err := elastic.NewClient(elastic.SetURL(config.EsUrl)) //todo 屏蔽
+	//if err != nil {
+	//	molog.ErrorLog.Printf("connect es  err:%v\n", err)
+	//	return
+	//}
 	molog.InfoLog.Printf("connect es success\n")
 	cli, err := mongo.Connect(context.Background(), options.Client().ApplyURI(config.MongodbUrl))
 	if err != nil {
@@ -185,8 +193,10 @@ func main() {
 				molog.InfoLog.Printf("sync historical data goroutine: %d start \n", i)
 				defer molog.InfoLog.Printf("sync historical data goroutine: %d exit \n", i)
 				defer syncg.Done()
-				bulks := make([]elastic.BulkableRequest, 5000)
-				bulk := esCli.Bulk()
+				//bulks := make([]elastic.BulkableRequest, 5000)
+				bulks := make([]esutil.BulkIndexerItem, 5000)
+				//bulk := esCli.Bulk()
+				indexer, _ := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{Client: esClient})
 				for {
 					count := 0
 					for i := 0; i < 5000; i++ {
@@ -202,27 +212,45 @@ func main() {
 								molog.ErrorLog.Printf("sync historical data json marshal err:%v id:%s\n", err, id)
 								continue
 							}
-							doc := elastic.NewBulkIndexRequest().Index(config.MongoDB + "." + config.MongoColl).Type("_doc").Id(id).Doc(string(bytes))
+							//doc := elastic.NewBulkIndexRequest().Index(config.MongoDB + "." + config.MongoColl).Type("_doc").Id(id).Doc(string(bytes))
+							doc := esutil.BulkIndexerItem{DocumentID: id, Action: "index", Body: strings.NewReader(string(bytes)), Index: config.MongoDB + "." + config.MongoColl}
 							bulks[count] = doc
 							count++
 						}
 					}
 
 					if count != 0 {
-						bulk.Add(bulks[:count]...)
-						bulkResponse, err := bulk.Do(context.Background())
-						if err != nil {
-							molog.ErrorLog.Printf("batch processing, bulk do err:%v count:%d\n", err, len(bulks))
-							//很可能是es挂了，等待十秒再重试
-							time.Sleep(time.Second * 10)
+						//bulk.Add(bulks[:count]...)
+						//bulkResponse, err := bulk.Do(context.Background())
+						//if err != nil {
+						//	molog.ErrorLog.Printf("batch processing, bulk do err:%v count:%d\n", err, len(bulks))
+						//	//很可能是es挂了，等待十秒再重试
+						//	time.Sleep(time.Second * 10)
+						//	continue
+						//}
+						//for _, v := range bulkResponse.Failed() {
+						//	molog.ErrorLog.Printf("index: %s, type: %s, _id: %s, error: %+v\n", v.Index, v.Type, v.Id, *v.Error)
+						//}
+						flag := false
+						for i := 0; i < count; i++ {
+							err := indexer.Add(context.Background(), bulks[i])
+							if err != nil {
+								flag = true
+								molog.ErrorLog.Println("SyncTypeFull error: ", bulks[i], err)
+							}
+						}
+						if flag {
 							continue
 						}
-						for _, v := range bulkResponse.Failed() {
-							molog.ErrorLog.Printf("index: %s, type: %s, _id: %s, error: %+v\n", v.Index, v.Type, v.Id, *v.Error)
+						indexer.Close(context.Background())
+						indexer, err = esutil.NewBulkIndexer(esutil.BulkIndexerConfig{Client: esClient})
+						if err != nil {
+							molog.ErrorLog.Println("error: ", err)
 						}
-						bulk.Reset()
+						//bulk.Reset()
 						count = 0
 					} else {
+						indexer.Close(context.Background())
 						break
 					}
 				}
@@ -312,29 +340,58 @@ func main() {
 	insertes := make(chan ElasticObj, 10000)
 
 	go func() {
-		bulk := esCli.Bulk()
-		bulks := make([]elastic.BulkableRequest, 0)
+		//bulk := esCli.Bulk()
+		indexer, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{Client: esClient})
+		if err != nil {
+			molog.ErrorLog.Println("error: ", err)
+		}
+		//bulks := make([]elastic.BulkableRequest, 0)
+		bulks := make([]esutil.BulkIndexerItem, 0)
+
 		bulksLock := sync.Mutex{}
 		go func() {
 			for {
 				select {
 				case <-time.After(time.Second):
 					if len(bulks) == 0 {
+						molog.InfoLog.Println("timer len: 0")
 						continue
 					}
 					bulksLock.Lock()
-					bulk.Add(bulks...)
-					bulkResponse, err := bulk.Do(context.Background())
-					if err != nil {
-						molog.ErrorLog.Printf("batch processing, bulk do err:%v count:%d\n", err, len(bulks))
-						bulksLock.Unlock()
+					//bulk.Add(bulks...)
+					//bulkResponse, err := bulk.Do(context.Background())
+					//if err != nil {
+					//	molog.ErrorLog.Printf("batch processing, bulk do err:%v count:%d\n", err, len(bulks))
+					//	bulksLock.Unlock()
+					//	continue
+					//}
+					//for _, v := range bulkResponse.Failed() {
+					//	molog.ErrorLog.Printf("index: %s, type: %s, _id: %s, error: %+v\n", v.Index, v.Type, v.Id, *v.Error)
+					//}
+					flag2 := false
+					for i := 0; i < len(bulks); i++ {
+						err := indexer.Add(context.Background(), bulks[i])
+						if err != nil {
+							molog.ErrorLog.Println("SyncTypeIncr error: ", bulks[i], err)
+							bulksLock.Unlock()
+							flag2 = true
+							break
+						}
+					}
+					if flag2 {
 						continue
 					}
-					for _, v := range bulkResponse.Failed() {
-						molog.ErrorLog.Printf("index: %s, type: %s, _id: %s, error: %+v\n", v.Index, v.Type, v.Id, *v.Error)
+
+					indexer.Close(context.Background())
+					indexer, err = esutil.NewBulkIndexer(esutil.BulkIndexerConfig{Client: esClient})
+					if err != nil {
+						molog.ErrorLog.Println("error: ", err)
 					}
-					bulk.Reset()
-					bulks = make([]elastic.BulkableRequest, 0)
+					//bulk.Reset()
+					//bulks = make([]elastic.BulkableRequest, 0)
+					molog.InfoLog.Println("timer will reset:", len(bulks))
+
+					bulks = make([]esutil.BulkIndexerItem, 0)
 					bulksLock.Unlock()
 				}
 			}
@@ -343,7 +400,15 @@ func main() {
 		for {
 			select {
 			case obj := <-insertes:
-				doc := elastic.NewBulkIndexRequest().Index(config.MongoDB + "." + config.MongoColl).Type("_doc").Id(obj.ID).Doc(obj.Obj)
+				//doc := elastic.NewBulkIndexRequest().Index(config.MongoDB + "." + config.MongoColl).Type("_doc").Id(obj.ID).Doc(obj.Obj)
+				bytes, err := json.Marshal(obj)
+				if err != nil {
+					molog.ErrorLog.Printf("data json marshal err:%v id:%s\n", err, obj.ID)
+					continue
+				}
+				molog.InfoLog.Println("oplog receive:", obj.ID)
+				doc := esutil.BulkIndexerItem{DocumentID: obj.ID, Action: "index", Body: strings.NewReader(string(bytes)), Index: config.MongoDB + "." + config.MongoColl}
+
 				bulksLock.Lock()
 				bulks = append(bulks, doc)
 				bulksLock.Unlock()
@@ -395,14 +460,19 @@ func main() {
 			var obj ElasticObj
 			obj.ID = id
 			obj.Obj = o.Doc
+			molog.InfoLog.Println("oplog i:", id)
 			insertes <- obj
 		case "d":
 			id := o.Doc["_id"].(primitive.ObjectID).Hex()
-			_, err := esCli.Delete().Index(config.MongoDB + "." + config.MongoColl).Type("_doc").Id(id).Do(context.Background())
+			//_, err := esCli.Delete().Index(config.MongoDB + "." + config.MongoColl).Type("_doc").Id(id).Do(context.Background())
+			req := esapi.DeleteRequest{Index: config.MongoDB + "." + config.MongoColl, DocumentID: id}
+			_, err := req.Do(context.Background(), GetEs())
 			if err != nil {
 				molog.ErrorLog.Printf("delete document in es err:%v id:%s\n", err, id)
 				continue
 			}
+			molog.InfoLog.Println("oplog d:", id)
+
 		case "u":
 			id := o.Update["_id"].(primitive.ObjectID).Hex()
 			objId, err := primitive.ObjectIDFromHex(id)
@@ -423,7 +493,50 @@ func main() {
 			var elasticObj ElasticObj
 			elasticObj.ID = id
 			elasticObj.Obj = obj
+			molog.InfoLog.Println("oplog u:", id)
 			insertes <- elasticObj
 		}
 	}
+}
+
+var esClient *elasticsearch.Client
+
+func GetEs() *elasticsearch.Client {
+	return esClient
+}
+
+func InitEs(config *service.Config) {
+	var r map[string]interface{}
+	cfg := elasticsearch.Config{
+		Addresses: []string{
+			config.EsUrl,
+			//"http://10.0.0.201:19200",
+			////"http://localhost:9201",
+		},
+		// ...
+	}
+	es, err := elasticsearch.NewClient(cfg)
+	if err != nil {
+		panic(err)
+	}
+	// 1. Get cluster info
+	//
+	res, err := es.Info()
+	if err != nil {
+		log.Fatalf("Error getting response: %s", err)
+	}
+	// Check response status
+	if res.IsError() {
+		log.Fatalf("Error: %s", res.String())
+	}
+	// Deserialize the response into a map.
+	if err := json.NewDecoder(res.Body).Decode(&r); err != nil {
+		log.Fatalf("Error parsing the response body: %s", err)
+	}
+	// Print client and server version numbers.
+	log.Printf("Client: %s", elasticsearch.Version)
+	log.Printf("Server: %s", r["version"].(map[string]interface{})["number"])
+	log.Println(strings.Repeat("~", 37))
+
+	esClient = es
 }

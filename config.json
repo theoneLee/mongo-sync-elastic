@@ -1,8 +1,8 @@
 {
-  "mongodb": "mydb",
-  "mongocoll": "mycoll",
-  "mongodburl": "mongodb://root:pwd@localhost:27017",
-  "esurl": "http://127.0.0.1:9200",
+  "mongodb": "test_replica",
+  "mongocoll": "test_a",
+  "mongodburl": "mongodb://root:123456@10.0.0.201:27017/",
+  "esurl": "http://10.0.0.201:19200",
   "tspath": "./",
   "syncType": 0
 }
