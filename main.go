@@ -163,7 +163,7 @@ func main() {
 	if !exists || config.SyncType == service.SyncTypeFull {
 
 		if config.SyncType != service.SyncTypeFull {
-			//开始同步之前找到最新的ts
+			//开始同步之前找到oplog最新的ts
 			filter := validOps()
 			opts := &options.FindOneOptions{}
 			opts.SetSort(bson.M{"$natural": -1})
@@ -242,7 +242,7 @@ func main() {
 						if flag {
 							continue
 						}
-						indexer.Close(context.Background())
+						indexer.Close(context.Background()) //todo 这种reset方式？
 						indexer, err = esutil.NewBulkIndexer(esutil.BulkIndexerConfig{Client: esClient})
 						if err != nil {
 							molog.ErrorLog.Println("error: ", err)
